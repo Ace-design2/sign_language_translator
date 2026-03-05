@@ -5,9 +5,23 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 # Configure environment - Easily switch between Kaggle and local environments
-IS_KAGGLE = False
-BASE_DIR = '/kaggle/input/asl-fingerspelling/' if IS_KAGGLE else './data/'
-TRAIN_CSV_PATH = os.path.join(BASE_DIR, 'train.csv')
+IS_KAGGLE = True  # Make sure this is True when on the website
+
+if IS_KAGGLE:
+    # This is the standard path for this specific Google dataset on Kaggle
+    BASE_DIR = '/kaggle/input/asl-fingerspelling'
+else:
+    BASE_DIR = './data'
+
+train_csv_path = os.path.join(BASE_DIR, 'train.csv')
+
+if os.path.exists(train_csv_path):
+    df = pd.read_csv(train_csv_path)
+    print(f"Success! Loaded {len(df)} rows.")
+else:
+    print(f"Error: '{train_csv_path}' not found.")
+    # This will list all files available so you can see the correct folder name
+    print("Available files:", os.listdir('/kaggle/input/'))
 
 def get_hand_columns():
     """
@@ -136,13 +150,13 @@ def main():
     print(f"Looking for dataset in: {BASE_DIR}")
     print("="*50)
     
-    if not os.path.exists(TRAIN_CSV_PATH):
-        print(f"Error: '{TRAIN_CSV_PATH}' not found.")
+    if not os.path.exists(train_csv_path):
+        print(f"Error: '{train_csv_path}' not found.")
         print("Please place your local data in the expected directory, or flip IS_KAGGLE to True if running on Kaggle.")
         return
         
     # 1. Filter train.csv
-    filtered_df = filter_intro_phrases(TRAIN_CSV_PATH)
+    filtered_df = filter_intro_phrases(train_csv_path)
     print(f"Found {len(filtered_df)} phrases matching introduction keywords.")
     
     if len(filtered_df) > 0:
