@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import numpy as np
 import pyarrow.parquet as pq
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -45,18 +46,27 @@ def load_hand_landmarks(parquet_path):
     # saving massive amounts of RAM on Kaggle.
     # -------------------------------------------------------------------------
     print(f"Loading hand landmarks from {parquet_path}...")
-    cols_to_load = ['frame'] + get_hand_columns()
+    # Add sequence_id to loaded columns so we can filter by it later
+    cols_to_load = ['sequence_id', 'frame'] + get_hand_columns()
     
     try:
         table = pq.read_table(parquet_path, columns=cols_to_load)
     except ValueError as e:
         print(f"Default columns not found, attempting alternative schema. ({e})")
-        cols_to_load = ['frame']
+        cols_to_load = ['sequence_id', 'frame']
         for hand in ['left_hand', 'right_hand']:
             for i in range(21):
                 for dim in ['x', 'y', 'z']:
                     cols_to_load.append(f'{hand}_{i}_{dim}')
-        table = pq.read_table(parquet_path, columns=cols_to_load)
+        
+        # If sequence_id isn't a top-level column, it might be the row index
+        # PyArrow allows loading without it and we'll check the index
+        try:
+            table = pq.read_table(parquet_path, columns=cols_to_load)
+        except ValueError:
+            # Fallback stringently without sequence_id in cols_to_load, relying on index
+            cols_to_load = [c for c in cols_to_load if c != 'sequence_id']
+            table = pq.read_table(parquet_path, columns=cols_to_load)
 
     return table.to_pandas()
 
@@ -122,46 +132,92 @@ def main():
     # 1. Use supplemental_metadata for sentences/greetings!
     metadata_path = find_file('supplemental_metadata.csv')
 
-    if metadata_path:
-        df = pd.read_csv(metadata_path)
-        print(f"✅ Found conversational data at: {metadata_path}")
-        print(f"Loaded {len(df)} sentence sequences.")
-    else:
-        print("❌ Still missing. Check the 'Data' tab in your Kaggle sidebar and ensure the dataset is added.")
+    if not metadata_path:
+        print("❌ Missing metadata file.")
         return
 
-    # 2. Filter for basic greeting/intro keywords
-    keywords = ['how', 'you', 'meet', 'name', 'hello', 'hi', 'thank', 'want']
-    greetings_df = df[df['phrase'].astype(str).str.contains('|'.join(keywords), case=False, na=False)]
+    df = pd.read_csv(metadata_path)
+    
+    # 2. Update filter to find exact words (using \b for word boundaries so 'this' doesn't trigger 'hi')
+    keywords = [r'\bhow\b', r'\byou\b', r'\bmeet\b', r'\bname\b', r'\bhello\b', r'\bhi\b', r'\bthank\b', r'\bwant\b']
+    greetings_df = df[df['phrase'].astype(str).str.contains('|'.join(keywords), case=False, na=False, regex=True)]
 
     print(f"Filtered to {len(greetings_df)} relevant introduction/greeting clips.")
-    if len(greetings_df) > 0:
-        print(greetings_df[['phrase', 'path']].head())
-
-        # 3. Get the path for the first greeting in your list
-        sample_path = greetings_df.iloc[0]['path']
-        
-        # Kaggle paths in the CSV are relative, so we fix them:
+    
+    # --- THIS IS THE NEW PART: BUILDING THE DATASET ---
+    
+    X_data = []
+    y_labels = []
+    
+    # Process ALL filtered greetings instead of just 10!
+    # Note: 5186 clips will take a bit of time to process on Kaggle, so we add a counter.
+    total_clips = len(greetings_df)
+    
+    for idx, row in greetings_df.iterrows():
+        phrase = row['phrase']
+        sample_path = row['path']
+        sequence_id = row['sequence_id']
         full_parquet_path = find_file(os.path.basename(sample_path))
 
         if full_parquet_path:
-            # Load only the hands to save 180GB of headaches
-            # Each parquet file contains 1629 columns; we only need a few.
             landmarks_df = load_hand_landmarks(full_parquet_path)
             
-            # Filter for just the Right Hand coordinates (21 points * 3 axes = 63 columns)
-            hand_cols = [c for c in landmarks_df.columns if 'right_hand' in c]
-            if 'frame' in landmarks_df.columns:
-                hand_cols = ['frame'] + hand_cols
+            # 1. Filter the huge dataframe down to JUST this sequence's video frames
+            if 'sequence_id' in landmarks_df.columns:
+                landmarks_df = landmarks_df[landmarks_df['sequence_id'] == sequence_id]
+            elif landmarks_df.index.name == 'sequence_id':
+                try:
+                    landmarks_df = landmarks_df.loc[sequence_id]
+                except KeyError:
+                    pass 
                 
-            hand_data = landmarks_df[hand_cols].dropna() # Remove frames where hand wasn't found
-
-            print(f"Extracted {len(hand_data)} frames of right-hand movement for the phrase: '{greetings_df.iloc[0]['phrase']}'")
+            # Get only right hand columns, ignore the 'frame' index for the math model
+            hand_cols = [c for c in landmarks_df.columns if 'right_hand' in c]
+            hand_data = landmarks_df[hand_cols].dropna() 
             
-            print("Plotting the first valid frame...")
-            plot_first_valid_frame(landmarks_df)
-        else:
-            print(f"❌ Parquet file not found for {os.path.basename(sample_path)}")
+            # Convert the Pandas DataFrame into a raw Math Array (NumPy)
+            sequence_array = hand_data.values 
+            
+            if len(sequence_array) > 0:
+                X_data.append(sequence_array)
+                y_labels.append(phrase)
+                
+        # --- Print progress every 500 videos so Kaggle doesn't look frozen! ---
+        if len(X_data) % 500 == 0 and len(X_data) > 0:
+            print(f"⏳ Processed {len(X_data)} / {total_clips} conversational sequences...")
+            print(f"✅ Last extracted array for: '{phrase}' -> Shape: {sequence_array.shape}")
+
+    print("\n--- DATA EXTRACTION COMPLETE ---")
+    print(f"Successfully built {len(X_data)} sequences of X (features) and Y (labels)")
+    
+    if len(X_data) > 0:
+        # --- NEW: PADDING SEQUENCES ---
+        # Neural networks need all inputs to be the exact same shape!
+        # Find the longest video sequence in our batch
+        max_length = max([seq.shape[0] for seq in X_data])
+        print(f"Padding all sequences to {max_length} frames...")
+        
+        # Pad all shorter sequences with zeroes to match the longest one
+        X_padded = []
+        for seq in X_data:
+            # How many blank frames do we need to add to the end?
+            pad_amount = max_length - seq.shape[0]
+            # Pad with 0s at the bottom (axis 0), do nothing to the 63 coordinates (axis 1)
+            padded_seq = np.pad(seq, ((0, pad_amount), (0, 0)), mode='constant', constant_values=0)
+            X_padded.append(padded_seq)
+            
+        # Convert lists to final Machine Learning Tensors (Numpy Arrays)
+        X = np.array(X_padded)
+        y = np.array(y_labels)
+        
+        print("\n--- READY FOR MACHINE LEARNING ---")
+        print(f"Final X Shape (Videos, Frames, Coordinates): {X.shape}") 
+        print(f"Final y Shape (Labels): {y.shape}")
+        
+        # Save them to disk so you can load them directly into TensorFlow later
+        np.save("X_data.npy", X)
+        np.save("y_labels.npy", y)
+        print("✅ Saved 'X_data.npy' and 'y_labels.npy' to Kaggle Output folder!")
 
 if __name__ == "__main__":
     main()
