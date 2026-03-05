@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
+import gc  # Added for memory management
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
@@ -165,11 +166,23 @@ def main():
             # 1. Filter the huge dataframe down to JUST this sequence's video frames
             if 'sequence_id' in landmarks_df.columns:
                 landmarks_df = landmarks_df[landmarks_df['sequence_id'] == sequence_id]
+            elif hasattr(landmarks_df.index, 'names') and 'sequence_id' in landmarks_df.index.names:
+                try:
+                    if isinstance(landmarks_df.index, pd.MultiIndex):
+                        landmarks_df = landmarks_df.xs(sequence_id, level='sequence_id', drop_level=False)
+                    else:
+                        landmarks_df = landmarks_df.loc[sequence_id]
+                    if isinstance(landmarks_df, pd.Series):
+                        landmarks_df = landmarks_df.to_frame().T
+                except KeyError:
+                    pass
             elif landmarks_df.index.name == 'sequence_id':
                 try:
                     landmarks_df = landmarks_df.loc[sequence_id]
+                    if isinstance(landmarks_df, pd.Series):
+                        landmarks_df = landmarks_df.to_frame().T
                 except KeyError:
-                    pass 
+                    pass
                 
             # Get only right hand columns, ignore the 'frame' index for the math model
             hand_cols = [c for c in landmarks_df.columns if 'right_hand' in c]
@@ -178,10 +191,27 @@ def main():
             # Convert the Pandas DataFrame into a raw Math Array (NumPy)
             sequence_array = hand_data.values 
             
+            # --- SAFEGUARD: Prevent OOM Crashes ---
+            # A normal ASL phrase takes between 30 and 400 frames.
+            # If sequence_array is 90,000 frames long, it means the sequence_id filter failed earlier 
+            # and we accidentally grabbed the ENTIRE parquet file. We must skip this!
+            if len(sequence_array) > 2000:
+                print(f"⚠️ Warning: Sequence {sequence_id} is suspiciously long ({len(sequence_array)} frames). Filtering failed. Skipping to save RAM.")
+                continue
+
             if len(sequence_array) > 0:
                 X_data.append(sequence_array)
                 y_labels.append(phrase)
                 
+        # --- Memory Management: CRITICAL for Kaggle! ---
+        # Python holds onto large dataframes too long in loops. 
+        # We must explicitly delete them and force garbage collection.
+        if 'landmarks_df' in locals():
+            del landmarks_df
+        if 'hand_data' in locals():
+            del hand_data  
+        gc.collect()
+
         # --- Print progress every 500 videos so Kaggle doesn't look frozen! ---
         if len(X_data) % 500 == 0 and len(X_data) > 0:
             print(f"⏳ Processed {len(X_data)} / {total_clips} conversational sequences...")
